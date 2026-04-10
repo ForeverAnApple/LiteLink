@@ -1,0 +1,125 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+pub const BLENDSHAPE_COUNT: usize = 61;
+
+/// Names of the 61 ARKit blendshapes, indexed to match LiveLink packet order.
+pub const ARKIT_BLENDSHAPE_NAMES: [&str; BLENDSHAPE_COUNT] = [
+    // Eyes (0-13)
+    "EyeBlinkLeft",
+    "EyeLookDownLeft",
+    "EyeLookInLeft",
+    "EyeLookOutLeft",
+    "EyeLookUpLeft",
+    "EyeSquintLeft",
+    "EyeWideLeft",
+    "EyeBlinkRight",
+    "EyeLookDownRight",
+    "EyeLookInRight",
+    "EyeLookOutRight",
+    "EyeLookUpRight",
+    "EyeSquintRight",
+    "EyeWideRight",
+    // Jaw & Mouth (14-40)
+    "JawForward",
+    "JawLeft",
+    "JawRight",
+    "JawOpen",
+    "MouthClose",
+    "MouthFunnel",
+    "MouthPucker",
+    "MouthLeft",
+    "MouthRight",
+    "MouthSmileLeft",
+    "MouthSmileRight",
+    "MouthFrownLeft",
+    "MouthFrownRight",
+    "MouthDimpleLeft",
+    "MouthDimpleRight",
+    "MouthStretchLeft",
+    "MouthStretchRight",
+    "MouthRollLower",
+    "MouthRollUpper",
+    "MouthShrugLower",
+    "MouthShrugUpper",
+    "MouthPressLeft",
+    "MouthPressRight",
+    "MouthLowerDownLeft",
+    "MouthLowerDownRight",
+    "MouthUpperUpLeft",
+    "MouthUpperUpRight",
+    // Brow (41-45)
+    "BrowDownLeft",
+    "BrowDownRight",
+    "BrowInnerUp",
+    "BrowOuterUpLeft",
+    "BrowOuterUpRight",
+    // Cheek, Nose, Tongue (46-51)
+    "CheekPuff",
+    "CheekSquintLeft",
+    "CheekSquintRight",
+    "NoseSneerLeft",
+    "NoseSneerRight",
+    "TongueOut",
+    // Head & Eye Pose (52-60) - values in radians
+    "HeadYaw",
+    "HeadPitch",
+    "HeadRoll",
+    "EyeYawLeft",
+    "EyePitchLeft",
+    "EyeRollLeft",
+    "EyeYawRight",
+    "EyePitchRight",
+    "EyeRollRight",
+];
+
+/// Shared tracking state between UDP receiver and OSC sender.
+///
+/// Protected by `RwLock` - receiver writes, sender reads.
+pub struct TrackingState {
+    /// The 61 ARKit blendshape values (0.0-1.0 for expressions, radians for head/eye pose).
+    pub blendshapes: [f32; BLENDSHAPE_COUNT],
+    /// Device identifier from the LiveLink packet header.
+    pub device_id: String,
+    /// Subject name from the LiveLink packet header.
+    pub subject_name: String,
+    /// Frame number from the most recent packet.
+    pub frame_number: u32,
+    /// Timestamp of the last received packet.
+    pub last_packet_time: Option<Instant>,
+    /// Total packets received (for stats).
+    pub packets_received: u64,
+}
+
+/// Connection status as an atomic - no lock needed to read/write.
+pub static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+impl TrackingState {
+    pub fn new() -> Self {
+        Self {
+            blendshapes: [0.0; BLENDSHAPE_COUNT],
+            device_id: String::new(),
+            subject_name: String::new(),
+            frame_number: 0,
+            last_packet_time: None,
+            packets_received: 0,
+        }
+    }
+
+    /// Check timeout and update CONNECTED atomic. Returns true if state changed.
+    pub fn check_timeout(&self, timeout: Duration) -> bool {
+        let was_connected = CONNECTED.load(Ordering::Relaxed);
+        let is_connected = self
+            .last_packet_time
+            .is_some_and(|t| t.elapsed() <= timeout);
+        CONNECTED.store(is_connected, Ordering::Relaxed);
+        was_connected != is_connected
+    }
+
+    /// Mark as connected (called by receiver on successful parse).
+    pub fn mark_connected(&mut self) {
+        self.last_packet_time = Some(Instant::now());
+        self.packets_received += 1;
+        CONNECTED.store(true, Ordering::Relaxed);
+    }
+}
