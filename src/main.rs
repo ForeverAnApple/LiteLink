@@ -44,10 +44,10 @@ struct Args {
     #[arg(long, default_value_t = 2.0)]
     timeout: f64,
 
-    /// Launch the status window (requires gui feature)
+    /// Run without the status window (only relevant when compiled with gui feature)
     #[cfg(feature = "gui")]
     #[arg(long)]
-    gui: bool,
+    headless: bool,
 }
 
 fn main() {
@@ -87,9 +87,9 @@ fn main() {
         args.send_rate, args.prefix
     );
 
-    // GUI path: eframe takes over the main thread
+    // GUI path: eframe takes over the main thread (default when compiled with gui feature)
     #[cfg(feature = "gui")]
-    if args.gui {
+    if !args.headless {
         if let Err(e) = gui::run(Arc::clone(&state)) {
             error!("GUI error: {e}");
         }
