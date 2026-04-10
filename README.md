@@ -4,6 +4,16 @@ Fast & lightweight LiveLink Face → VRChat OSC bridge. Single binary, cross-pla
 
 ![Demo](assets/demo.gif)
 
+## Why LiteLink?
+
+| | LiteLink | VRCFaceTracking (.NET) |
+|---|---|---|
+| Memory | **~3 MB** | ~55 MB |
+| Binary size | **~12 MB** | ~150 MB installed |
+| Dependencies | **None** | .NET runtime |
+
+Same tracking performance, 18x less memory, 12x smaller binary, zero dependencies. Runs on Linux natively — just download and go.
+
 ## Install
 
 Grab a binary from [Releases](https://github.com/ForeverAnApple/LiveLinkVRCFaceTracking/releases):
