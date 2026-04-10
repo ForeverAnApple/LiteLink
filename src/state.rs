@@ -24,6 +24,9 @@ pub struct TrackingState {
 /// Connection status as an atomic - no lock needed to read/write.
 pub static CONNECTED: AtomicBool = AtomicBool::new(false);
 
+/// Global shutdown flag, set by Ctrl+C handler or GUI close.
+pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
 impl TrackingState {
     pub fn new() -> Self {
         Self {

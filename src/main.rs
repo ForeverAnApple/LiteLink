@@ -1,10 +1,12 @@
+#[cfg(feature = "gui")]
+mod gui;
 mod livelink;
 mod mapping;
 mod osc;
 mod state;
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,9 +15,7 @@ use log::{debug, error, info, warn};
 
 use crate::mapping::map_blendshapes;
 use crate::osc::OscSender;
-use crate::state::{TrackingState, CONNECTED};
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+use crate::state::{TrackingState, CONNECTED, SHUTDOWN};
 
 fn should_run() -> bool {
     !SHUTDOWN.load(Ordering::Relaxed)
@@ -43,6 +43,11 @@ struct Args {
     /// Connection timeout in seconds
     #[arg(long, default_value_t = 2.0)]
     timeout: f64,
+
+    /// Launch the status window (requires gui feature)
+    #[cfg(feature = "gui")]
+    #[arg(long)]
+    gui: bool,
 }
 
 fn main() {
@@ -82,6 +87,19 @@ fn main() {
         args.send_rate, args.prefix
     );
 
+    // GUI path: eframe takes over the main thread
+    #[cfg(feature = "gui")]
+    if args.gui {
+        if let Err(e) = gui::run(Arc::clone(&state)) {
+            error!("GUI error: {e}");
+        }
+        SHUTDOWN.store(true, Ordering::Relaxed);
+        let _ = recv_thread.join();
+        let _ = send_thread.join();
+        return;
+    }
+
+    // Headless path
     let _ = recv_thread.join();
     let _ = send_thread.join();
     info!("goodbye");
