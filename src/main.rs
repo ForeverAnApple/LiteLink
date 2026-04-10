@@ -51,11 +51,17 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sniff OSC messages on a port (capture what another app sends to VRChat)
+    /// Proxy OSC messages: listen on a port, log them, forward to VRChat.
+    /// Configure VRCFT to send to --listen-port instead of 9000,
+    /// and this will log + forward everything to --forward-to.
     Sniff {
-        /// Port to listen on (e.g. 9000 to capture what VRCFT sends)
-        #[arg(default_value_t = 9000)]
-        port: u16,
+        /// Port to listen on (tell VRCFT to send here instead of 9000)
+        #[arg(long, default_value_t = 9001)]
+        listen_port: u16,
+
+        /// Forward captured messages to this address (VRChat)
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        forward_to: String,
     },
 }
 
@@ -72,8 +78,14 @@ fn main() {
     .expect("failed to set Ctrl+C handler");
 
     // Handle subcommands
-    if let Some(Command::Sniff { port }) = &args.command {
-        run_sniff(*port);
+    if let Some(Command::Sniff {
+        listen_port: sniff_port,
+        forward_to,
+    }) = &args.command
+    {
+        let forward_addr: std::net::SocketAddr =
+            forward_to.parse().expect("invalid --forward-to address");
+        run_sniff(*sniff_port, forward_addr);
         return;
     }
 
@@ -265,23 +277,27 @@ fn run_sender(
     }
 }
 
-/// Sniff mode: listen for OSC messages on a port and log them.
-/// Useful to capture what VRCFT actually sends to VRChat for comparison.
-fn run_sniff(port: u16) {
-    info!("sniffing OSC messages on UDP :{port} (Ctrl+C to stop)");
-    info!("run VRCFT or another app that sends to this port, then compare output");
+/// Sniff/proxy mode: listen for OSC messages, log them, and forward to VRChat.
+/// Configure VRCFT to send to our listen port instead of 9000.
+fn run_sniff(listen_port: u16, forward_to: std::net::SocketAddr) {
+    info!("OSC proxy: listening on :{listen_port}, forwarding to {forward_to}");
+    info!("configure VRCFT to send OSC to port {listen_port} instead of {}", forward_to.port());
 
-    let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).unwrap_or_else(|e| {
-        panic!("failed to bind to port {port}: {e}");
+    let socket = UdpSocket::bind(format!("0.0.0.0:{listen_port}")).unwrap_or_else(|e| {
+        panic!("failed to bind to port {listen_port}: {e}");
     });
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
 
+    // Socket for forwarding
+    let forward_socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind forward socket");
+
     let mut buf = [0u8; 8192];
     let mut msg_count: u64 = 0;
     let mut last_summary = Instant::now();
-    let mut param_tracker: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut param_tracker: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     while should_run() {
         let (len, src) = match socket.recv_from(&mut buf) {
@@ -290,7 +306,6 @@ fn run_sniff(port: u16) {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // Print summary periodically
                 if !param_tracker.is_empty() && last_summary.elapsed() >= Duration::from_secs(2) {
                     print_sniff_summary(&param_tracker, msg_count);
                     last_summary = Instant::now();
@@ -304,6 +319,13 @@ fn run_sniff(port: u16) {
         };
 
         let data = &buf[..len];
+
+        // Forward raw packet to VRChat immediately
+        if let Err(e) = forward_socket.send_to(data, forward_to) {
+            warn!("forward error: {e}");
+        }
+
+        // Decode and log
         match rosc::decoder::decode_udp(data) {
             Ok((_, packet)) => {
                 let messages = extract_messages(packet);
@@ -325,7 +347,6 @@ fn run_sniff(port: u16) {
         }
     }
 
-    // Final summary
     if !param_tracker.is_empty() {
         info!("=== FINAL SNAPSHOT ===");
         print_sniff_summary(&param_tracker, msg_count);
