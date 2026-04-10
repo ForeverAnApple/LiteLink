@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
 
-use crate::mapping::map_blendshapes;
+use crate::mapping::{map_blendshapes, OscValue};
 use crate::osc::OscSender;
 use crate::state::{TrackingState, CONNECTED};
 
@@ -40,18 +40,29 @@ struct Args {
     /// Connection timeout in seconds (mark disconnected after no packets for this long)
     #[arg(long, default_value_t = 2.0)]
     timeout: f64,
+
+    /// Log all outgoing OSC params once per second (for debugging)
+    #[arg(long)]
+    dump: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Sniff OSC messages on a port (capture what another app sends to VRChat)
+    Sniff {
+        /// Port to listen on (e.g. 9000 to capture what VRCFT sends)
+        #[arg(default_value_t = 9000)]
+        port: u16,
+    },
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
-    let osc_target: std::net::SocketAddr = args
-        .osc_target
-        .parse()
-        .expect("invalid OSC target address");
-    let send_interval = Duration::from_micros(1_000_000 / args.send_rate as u64);
-    let timeout = Duration::from_secs_f64(args.timeout);
 
     // Register Ctrl+C handler
     ctrlc::set_handler(|| {
@@ -59,6 +70,19 @@ fn main() {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })
     .expect("failed to set Ctrl+C handler");
+
+    // Handle subcommands
+    if let Some(Command::Sniff { port }) = &args.command {
+        run_sniff(*port);
+        return;
+    }
+
+    let osc_target: std::net::SocketAddr = args
+        .osc_target
+        .parse()
+        .expect("invalid OSC target address");
+    let send_interval = Duration::from_micros(1_000_000 / args.send_rate as u64);
+    let timeout = Duration::from_secs_f64(args.timeout);
 
     let state = Arc::new(RwLock::new(TrackingState::new()));
 
@@ -72,15 +96,19 @@ fn main() {
 
     // Spawn OSC sender thread
     let send_state = Arc::clone(&state);
+    let dump = args.dump;
     let send_thread = std::thread::Builder::new()
         .name("osc-sender".into())
-        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state))
+        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state, dump))
         .expect("failed to spawn sender thread");
 
     info!(
         "listening for LiveLink on UDP :{listen_port}, sending OSC to {osc_target} at {}Hz",
         args.send_rate
     );
+    if dump {
+        info!("--dump enabled: logging all outgoing params once per second");
+    }
 
     // Wait for threads to finish (they exit on SHUTDOWN)
     let _ = recv_thread.join();
@@ -103,8 +131,9 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
     while should_run() {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue; // timeout, check shutdown and loop
             }
@@ -123,7 +152,6 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
                     packet.frame_number, packet.device_id,
                 );
                 if let Ok(mut st) = state.write() {
-                    // Only update strings if they changed (avoids allocation)
                     if st.device_id != packet.device_id {
                         st.device_id = packet.device_id;
                     }
@@ -136,7 +164,6 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
                 }
             }
             Err(e) => {
-                // Try tail fallback for non-standard header versions
                 match livelink::parse_blendshapes_from_tail(data) {
                     Ok(shapes) => {
                         debug!("parsed {len} bytes via tail fallback from {src}");
@@ -159,26 +186,25 @@ fn run_sender(
     interval: Duration,
     timeout: Duration,
     state: Arc<RwLock<TrackingState>>,
+    dump: bool,
 ) {
     let mut sender = OscSender::new(target).expect("failed to create OSC sender");
 
     let mut last_log = Instant::now();
+    let mut last_dump = Instant::now();
     let mut send_count: u64 = 0;
-    let mut was_connected = false;
 
     while should_run() {
         let start = Instant::now();
 
-        // Read state (RwLock read - doesn't block receiver)
         let (blendshapes, connected, device_id, packets_received) = {
             let st = match state.read() {
                 Ok(st) => st,
-                Err(poisoned) => poisoned.into_inner(), // recover from poison
+                Err(poisoned) => poisoned.into_inner(),
             };
             let changed = st.check_timeout(timeout);
             let connected = CONNECTED.load(Ordering::Relaxed);
 
-            // Log connection state changes
             if changed {
                 if connected {
                     info!(
@@ -190,17 +216,30 @@ fn run_sender(
                 }
             }
 
-            (st.blendshapes, connected, st.device_id.clone(), st.packets_received)
+            (
+                st.blendshapes,
+                connected,
+                st.device_id.clone(),
+                st.packets_received,
+            )
         };
 
-        // Track connection transitions for startup message
-        if connected && !was_connected {
-            was_connected = true;
-        } else if !connected && was_connected {
-            was_connected = false;
+        let params = map_blendshapes(&blendshapes, connected);
+
+        // Dump all params once per second when --dump is enabled
+        if dump && last_dump.elapsed() >= Duration::from_secs(1) {
+            let mut lines = Vec::new();
+            for p in &params {
+                let val = match &p.value {
+                    OscValue::Float(v) => format!("{v:.4}"),
+                    OscValue::Bool(v) => format!("{v}"),
+                };
+                lines.push(format!("  {} = {}", p.address, val));
+            }
+            info!("--- OSC params ({} total) ---\n{}", lines.len(), lines.join("\n"));
+            last_dump = Instant::now();
         }
 
-        let params = map_blendshapes(&blendshapes, connected);
         if let Err(e) = sender.send_params(&params) {
             warn!("OSC send error: {e}");
         }
@@ -214,12 +253,7 @@ fn run_sender(
                     send_count, packets_received,
                 );
             } else {
-                info!(
-                    "stats: {} OSC bundles sent, waiting for LiveLink packets on UDP :{}",
-                    send_count,
-                    // We don't have the port here, but the startup log has it
-                    "11111"
-                );
+                info!("stats: {} OSC bundles sent, waiting for LiveLink packets", send_count);
             }
             last_log = Instant::now();
         }
@@ -229,4 +263,109 @@ fn run_sender(
             std::thread::sleep(interval - elapsed);
         }
     }
+}
+
+/// Sniff mode: listen for OSC messages on a port and log them.
+/// Useful to capture what VRCFT actually sends to VRChat for comparison.
+fn run_sniff(port: u16) {
+    info!("sniffing OSC messages on UDP :{port} (Ctrl+C to stop)");
+    info!("run VRCFT or another app that sends to this port, then compare output");
+
+    let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).unwrap_or_else(|e| {
+        panic!("failed to bind to port {port}: {e}");
+    });
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+
+    let mut buf = [0u8; 8192];
+    let mut msg_count: u64 = 0;
+    let mut last_summary = Instant::now();
+    let mut param_tracker: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    while should_run() {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Print summary periodically
+                if !param_tracker.is_empty() && last_summary.elapsed() >= Duration::from_secs(2) {
+                    print_sniff_summary(&param_tracker, msg_count);
+                    last_summary = Instant::now();
+                }
+                continue;
+            }
+            Err(e) => {
+                error!("recv error: {e}");
+                continue;
+            }
+        };
+
+        let data = &buf[..len];
+        match rosc::decoder::decode_udp(data) {
+            Ok((_, packet)) => {
+                let messages = extract_messages(packet);
+                for msg in &messages {
+                    let val = format_osc_args(&msg.args);
+                    param_tracker.insert(msg.addr.clone(), val);
+                    msg_count += 1;
+                }
+                debug!("{} messages from {src} ({msg_count} total)", messages.len());
+            }
+            Err(e) => {
+                warn!("failed to decode {len}-byte OSC packet from {src}: {e}");
+            }
+        }
+
+        if last_summary.elapsed() >= Duration::from_secs(2) {
+            print_sniff_summary(&param_tracker, msg_count);
+            last_summary = Instant::now();
+        }
+    }
+
+    // Final summary
+    if !param_tracker.is_empty() {
+        info!("=== FINAL SNAPSHOT ===");
+        print_sniff_summary(&param_tracker, msg_count);
+    }
+}
+
+fn extract_messages(packet: rosc::OscPacket) -> Vec<rosc::OscMessage> {
+    match packet {
+        rosc::OscPacket::Message(msg) => vec![msg],
+        rosc::OscPacket::Bundle(bundle) => bundle
+            .content
+            .into_iter()
+            .flat_map(extract_messages)
+            .collect(),
+    }
+}
+
+fn format_osc_args(args: &[rosc::OscType]) -> String {
+    args.iter()
+        .map(|a| match a {
+            rosc::OscType::Float(v) => format!("{v:.4}"),
+            rosc::OscType::Bool(v) => format!("{v}"),
+            rosc::OscType::Int(v) => format!("{v}"),
+            rosc::OscType::String(v) => format!("\"{v}\""),
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_sniff_summary(params: &std::collections::HashMap<String, String>, total: u64) {
+    let mut sorted: Vec<_> = params.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.as_str());
+    let mut lines = Vec::new();
+    for (addr, val) in &sorted {
+        lines.push(format!("  {addr} = {val}"));
+    }
+    info!(
+        "--- sniff: {} unique params, {total} msgs total ---\n{}",
+        sorted.len(),
+        lines.join("\n")
+    );
 }
