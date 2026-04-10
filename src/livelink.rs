@@ -1,14 +1,14 @@
 use crate::state::BLENDSHAPE_COUNT;
 
+/// Max allowed string length in packet headers (security bound).
+const MAX_STRING_LEN: usize = 256;
+
 /// Parsed LiveLink Face packet.
 #[derive(Debug, Clone)]
 pub struct LiveLinkPacket {
     pub device_id: String,
     pub subject_name: String,
     pub frame_number: u32,
-    pub sub_frame: f32,
-    pub fps_numerator: u32,
-    pub fps_denominator: u32,
     pub blendshapes: [f32; BLENDSHAPE_COUNT],
 }
 
@@ -25,6 +25,8 @@ pub enum ParseError {
         field: &'static str,
         source: std::string::FromUtf8Error,
     },
+    #[error("string field {field} too long: {len} bytes (max {MAX_STRING_LEN})")]
+    StringTooLong { field: &'static str, len: usize },
 }
 
 /// Read a big-endian u32 from a byte slice at the given offset.
@@ -71,6 +73,12 @@ pub fn parse_packet(data: &[u8]) -> Result<LiveLinkPacket, ParseError> {
     // Device ID
     let device_id_len = read_u32(data, pos) as usize;
     pos += 4;
+    if device_id_len > MAX_STRING_LEN {
+        return Err(ParseError::StringTooLong {
+            field: "device_id",
+            len: device_id_len,
+        });
+    }
     if pos + device_id_len > data.len() {
         return Err(ParseError::TooShort {
             need: pos + device_id_len,
@@ -94,6 +102,12 @@ pub fn parse_packet(data: &[u8]) -> Result<LiveLinkPacket, ParseError> {
     }
     let subject_name_len = read_u32(data, pos) as usize;
     pos += 4;
+    if subject_name_len > MAX_STRING_LEN {
+        return Err(ParseError::StringTooLong {
+            field: "subject_name",
+            len: subject_name_len,
+        });
+    }
     if pos + subject_name_len > data.len() {
         return Err(ParseError::TooShort {
             need: pos + subject_name_len,
@@ -121,12 +135,8 @@ pub fn parse_packet(data: &[u8]) -> Result<LiveLinkPacket, ParseError> {
 
     let frame_number = read_u32(data, pos);
     pos += 4;
-    let sub_frame = read_f32(data, pos);
-    pos += 4;
-    let fps_numerator = read_u32(data, pos);
-    pos += 4;
-    let fps_denominator = read_u32(data, pos);
-    pos += 4;
+    // Skip sub_frame(f32) + fps_num(u32) + fps_den(u32) — we don't use them
+    pos += 12;
 
     let blendshape_count = data[pos];
     pos += 1;
@@ -143,9 +153,6 @@ pub fn parse_packet(data: &[u8]) -> Result<LiveLinkPacket, ParseError> {
         device_id,
         subject_name,
         frame_number,
-        sub_frame,
-        fps_numerator,
-        fps_denominator,
         blendshapes,
     })
 }
@@ -226,8 +233,6 @@ mod tests {
         assert!((packet.blendshapes[0] - 0.5).abs() < f32::EPSILON);
         assert!((packet.blendshapes[17] - 0.8).abs() < f32::EPSILON);
         assert!((packet.blendshapes[51] - 1.0).abs() < f32::EPSILON);
-        assert_eq!(packet.fps_numerator, 30);
-        assert_eq!(packet.fps_denominator, 1);
     }
 
     #[test]
