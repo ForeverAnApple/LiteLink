@@ -4,7 +4,11 @@
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(find:*)",
+      "Bash(grep -E \"\\\\.cs$\")",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo nextest:*)"
     ]
   }
 }
