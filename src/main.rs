@@ -3,9 +3,11 @@ mod mapping;
 mod osc;
 mod state;
 
+use std::fs::File;
+use std::io::Write as IoWrite;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -13,7 +15,7 @@ use log::{debug, error, info, warn};
 
 use crate::mapping::{map_blendshapes, OscValue};
 use crate::osc::OscSender;
-use crate::state::{TrackingState, CONNECTED};
+use crate::state::{TrackingState, ARKIT_BLENDSHAPE_NAMES, BLENDSHAPE_COUNT, CONNECTED};
 
 /// Global shutdown flag, set by Ctrl+C handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -41,9 +43,9 @@ struct Args {
     #[arg(long, default_value_t = 2.0)]
     timeout: f64,
 
-    /// Log all outgoing OSC params once per second (for debugging)
+    /// Enable diagnostic logging to files in ./logs/
     #[arg(long)]
-    dump: bool,
+    log: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -63,6 +65,36 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:9000")]
         forward_to: String,
     },
+}
+
+/// Thread-safe log file writer.
+struct LogFile {
+    file: Mutex<File>,
+}
+
+impl LogFile {
+    fn create(path: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all("logs")?;
+        let file = File::create(path)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    fn write_line(&self, line: &str) {
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+}
+
+fn timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    format!("{secs}.{millis:03}")
 }
 
 fn main() {
@@ -85,7 +117,7 @@ fn main() {
     {
         let forward_addr: std::net::SocketAddr =
             forward_to.parse().expect("invalid --forward-to address");
-        run_sniff(*sniff_port, forward_addr);
+        run_sniff(*sniff_port, forward_addr, args.log);
         return;
     }
 
@@ -96,49 +128,81 @@ fn main() {
     let send_interval = Duration::from_micros(1_000_000 / args.send_rate as u64);
     let timeout = Duration::from_secs_f64(args.timeout);
 
+    // Set up log files if --log is enabled
+    let input_log = if args.log {
+        Some(Arc::new(
+            LogFile::create("logs/livelink_input.log")
+                .expect("failed to create logs/livelink_input.log"),
+        ))
+    } else {
+        None
+    };
+    let output_log = if args.log {
+        Some(Arc::new(
+            LogFile::create("logs/osc_output.log").expect("failed to create logs/osc_output.log"),
+        ))
+    } else {
+        None
+    };
+
+    if args.log {
+        info!("--log enabled: writing to logs/livelink_input.log and logs/osc_output.log");
+        // Write headers
+        if let Some(ref log) = input_log {
+            let header = std::iter::once("timestamp".to_string())
+                .chain(ARKIT_BLENDSHAPE_NAMES.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+                .join("\t");
+            log.write_line(&header);
+        }
+        if let Some(ref log) = output_log {
+            log.write_line("timestamp\taddress\tvalue");
+        }
+    }
+
     let state = Arc::new(RwLock::new(TrackingState::new()));
 
     // Spawn UDP receiver thread
     let recv_state = Arc::clone(&state);
     let listen_port = args.listen_port;
+    let recv_log = input_log.clone();
     let recv_thread = std::thread::Builder::new()
         .name("udp-receiver".into())
-        .spawn(move || run_receiver(listen_port, recv_state))
+        .spawn(move || run_receiver(listen_port, recv_state, recv_log))
         .expect("failed to spawn receiver thread");
 
     // Spawn OSC sender thread
     let send_state = Arc::clone(&state);
-    let dump = args.dump;
     let send_thread = std::thread::Builder::new()
         .name("osc-sender".into())
-        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state, dump))
+        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state, output_log))
         .expect("failed to spawn sender thread");
 
     info!(
         "listening for LiveLink on UDP :{listen_port}, sending OSC to {osc_target} at {}Hz",
         args.send_rate
     );
-    if dump {
-        info!("--dump enabled: logging all outgoing params once per second");
-    }
 
-    // Wait for threads to finish (they exit on SHUTDOWN)
     let _ = recv_thread.join();
     let _ = send_thread.join();
     info!("goodbye");
 }
 
-fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
+fn run_receiver(
+    port: u16,
+    state: Arc<RwLock<TrackingState>>,
+    log_file: Option<Arc<LogFile>>,
+) {
     let addr = format!("0.0.0.0:{port}");
     let socket = UdpSocket::bind(&addr).unwrap_or_else(|e| {
         panic!("failed to bind UDP socket on {addr}: {e}");
     });
-    // Short timeout so we can check SHUTDOWN periodically
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
 
     let mut buf = [0u8; 2048];
+    let mut last_log_time = Instant::now();
 
     while should_run() {
         let (len, src) = match socket.recv_from(&mut buf) {
@@ -147,7 +211,7 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                continue; // timeout, check shutdown and loop
+                continue;
             }
             Err(e) => {
                 error!("UDP recv error: {e}");
@@ -163,6 +227,18 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
                     "frame {} from {} ({src})",
                     packet.frame_number, packet.device_id,
                 );
+
+                // Log raw input blendshapes (throttled to ~10Hz to avoid huge files)
+                if let Some(ref log) = log_file {
+                    if last_log_time.elapsed() >= Duration::from_millis(100) {
+                        let ts = timestamp();
+                        let values: Vec<String> =
+                            packet.blendshapes.iter().map(|v| format!("{v:.6}")).collect();
+                        log.write_line(&format!("{ts}\t{}", values.join("\t")));
+                        last_log_time = Instant::now();
+                    }
+                }
+
                 if let Ok(mut st) = state.write() {
                     if st.device_id != packet.device_id {
                         st.device_id = packet.device_id;
@@ -175,20 +251,29 @@ fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
                     st.mark_connected();
                 }
             }
-            Err(e) => {
-                match livelink::parse_blendshapes_from_tail(data) {
-                    Ok(shapes) => {
-                        debug!("parsed {len} bytes via tail fallback from {src}");
-                        if let Ok(mut st) = state.write() {
-                            st.blendshapes = shapes;
-                            st.mark_connected();
+            Err(e) => match livelink::parse_blendshapes_from_tail(data) {
+                Ok(shapes) => {
+                    debug!("parsed {len} bytes via tail fallback from {src}");
+
+                    if let Some(ref log) = log_file {
+                        if last_log_time.elapsed() >= Duration::from_millis(100) {
+                            let ts = timestamp();
+                            let values: Vec<String> =
+                                shapes.iter().map(|v| format!("{v:.6}")).collect();
+                            log.write_line(&format!("{ts}\t{}", values.join("\t")));
+                            last_log_time = Instant::now();
                         }
                     }
-                    Err(_) => {
-                        warn!("unparseable {len}-byte packet from {src}: {e}");
+
+                    if let Ok(mut st) = state.write() {
+                        st.blendshapes = shapes;
+                        st.mark_connected();
                     }
                 }
-            }
+                Err(_) => {
+                    warn!("unparseable {len}-byte packet from {src}: {e}");
+                }
+            },
         }
     }
 }
@@ -198,12 +283,12 @@ fn run_sender(
     interval: Duration,
     timeout: Duration,
     state: Arc<RwLock<TrackingState>>,
-    dump: bool,
+    log_file: Option<Arc<LogFile>>,
 ) {
     let mut sender = OscSender::new(target).expect("failed to create OSC sender");
 
-    let mut last_log = Instant::now();
-    let mut last_dump = Instant::now();
+    let mut last_stats = Instant::now();
+    let mut last_log_time = Instant::now();
     let mut send_count: u64 = 0;
 
     while should_run() {
@@ -238,18 +323,19 @@ fn run_sender(
 
         let params = map_blendshapes(&blendshapes, connected);
 
-        // Dump all params once per second when --dump is enabled
-        if dump && last_dump.elapsed() >= Duration::from_secs(1) {
-            let mut lines = Vec::new();
-            for p in &params {
-                let val = match &p.value {
-                    OscValue::Float(v) => format!("{v:.4}"),
-                    OscValue::Bool(v) => format!("{v}"),
-                };
-                lines.push(format!("  {} = {}", p.address, val));
+        // Log output params (throttled to ~10Hz)
+        if let Some(ref log) = log_file {
+            if last_log_time.elapsed() >= Duration::from_millis(100) {
+                let ts = timestamp();
+                for p in &params {
+                    let val = match &p.value {
+                        OscValue::Float(v) => format!("{v:.6}"),
+                        OscValue::Bool(v) => format!("{v}"),
+                    };
+                    log.write_line(&format!("{ts}\t{}\t{val}", p.address));
+                }
+                last_log_time = Instant::now();
             }
-            info!("--- OSC params ({} total) ---\n{}", lines.len(), lines.join("\n"));
-            last_dump = Instant::now();
         }
 
         if let Err(e) = sender.send_params(&params) {
@@ -257,17 +343,19 @@ fn run_sender(
         }
         send_count += 1;
 
-        // Periodic stats every 30 seconds
-        if last_log.elapsed() >= Duration::from_secs(30) {
+        if last_stats.elapsed() >= Duration::from_secs(30) {
             if connected {
                 info!(
                     "stats: {} OSC bundles sent, {} LiveLink packets received, device=\"{device_id}\"",
                     send_count, packets_received,
                 );
             } else {
-                info!("stats: {} OSC bundles sent, waiting for LiveLink packets", send_count);
+                info!(
+                    "stats: {} OSC bundles sent, waiting for LiveLink packets",
+                    send_count
+                );
             }
-            last_log = Instant::now();
+            last_stats = Instant::now();
         }
 
         let elapsed = start.elapsed();
@@ -278,10 +366,22 @@ fn run_sender(
 }
 
 /// Sniff/proxy mode: listen for OSC messages, log them, and forward to VRChat.
-/// Configure VRCFT to send to our listen port instead of 9000.
-fn run_sniff(listen_port: u16, forward_to: std::net::SocketAddr) {
+fn run_sniff(listen_port: u16, forward_to: std::net::SocketAddr, log_enabled: bool) {
     info!("OSC proxy: listening on :{listen_port}, forwarding to {forward_to}");
-    info!("configure VRCFT to send OSC to port {listen_port} instead of {}", forward_to.port());
+    info!(
+        "configure VRCFT to send OSC to port {listen_port} instead of {}",
+        forward_to.port()
+    );
+
+    let log_file = if log_enabled {
+        let log = LogFile::create("logs/vrcft_sniff.log")
+            .expect("failed to create logs/vrcft_sniff.log");
+        log.write_line("timestamp\taddress\tvalue");
+        info!("--log enabled: writing sniffed params to logs/vrcft_sniff.log");
+        Some(log)
+    } else {
+        None
+    };
 
     let socket = UdpSocket::bind(format!("0.0.0.0:{listen_port}")).unwrap_or_else(|e| {
         panic!("failed to bind to port {listen_port}: {e}");
@@ -290,12 +390,12 @@ fn run_sniff(listen_port: u16, forward_to: std::net::SocketAddr) {
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
 
-    // Socket for forwarding
     let forward_socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind forward socket");
 
     let mut buf = [0u8; 8192];
     let mut msg_count: u64 = 0;
     let mut last_summary = Instant::now();
+    let mut last_log_time = Instant::now();
     let mut param_tracker: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
@@ -329,11 +429,25 @@ fn run_sniff(listen_port: u16, forward_to: std::net::SocketAddr) {
         match rosc::decoder::decode_udp(data) {
             Ok((_, packet)) => {
                 let messages = extract_messages(packet);
+                let should_log_this_tick = last_log_time.elapsed() >= Duration::from_millis(100);
+
                 for msg in &messages {
                     let val = format_osc_args(&msg.args);
-                    param_tracker.insert(msg.addr.clone(), val);
+                    param_tracker.insert(msg.addr.clone(), val.clone());
                     msg_count += 1;
+
+                    // Write to log file (throttled)
+                    if should_log_this_tick {
+                        if let Some(ref log) = log_file {
+                            let ts = timestamp();
+                            log.write_line(&format!("{ts}\t{}\t{val}", msg.addr));
+                        }
+                    }
                 }
+                if should_log_this_tick {
+                    last_log_time = Instant::now();
+                }
+
                 debug!("{} messages from {src} ({msg_count} total)", messages.len());
             }
             Err(e) => {
@@ -367,7 +481,7 @@ fn extract_messages(packet: rosc::OscPacket) -> Vec<rosc::OscMessage> {
 fn format_osc_args(args: &[rosc::OscType]) -> String {
     args.iter()
         .map(|a| match a {
-            rosc::OscType::Float(v) => format!("{v:.4}"),
+            rosc::OscType::Float(v) => format!("{v:.6}"),
             rosc::OscType::Bool(v) => format!("{v}"),
             rosc::OscType::Int(v) => format!("{v}"),
             rosc::OscType::String(v) => format!("\"{v}\""),
@@ -377,7 +491,10 @@ fn format_osc_args(args: &[rosc::OscType]) -> String {
         .join(", ")
 }
 
-fn print_sniff_summary(params: &std::collections::HashMap<String, String>, total: u64) {
+fn print_sniff_summary(
+    params: &std::collections::HashMap<String, String>,
+    total: u64,
+) {
     let mut sorted: Vec<_> = params.iter().collect();
     sorted.sort_by_key(|(k, _)| k.as_str());
     let mut lines = Vec::new();
