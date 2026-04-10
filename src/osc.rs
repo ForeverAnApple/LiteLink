@@ -13,7 +13,7 @@ pub struct OscSender {
     socket: UdpSocket,
     target: std::net::SocketAddr,
     /// Cache of last-sent values for change detection.
-    last_sent: HashMap<&'static str, CachedValue>,
+    last_sent: HashMap<String, CachedValue>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,7 +43,7 @@ impl OscSender {
                 OscValue::Bool(v) => CachedValue::Bool(*v),
             };
 
-            let changed = match self.last_sent.get(p.address) {
+            let changed = match self.last_sent.get(&p.address) {
                 Some(CachedValue::Float(old)) => match new_val {
                     CachedValue::Float(new) => (new - old).abs() > FLOAT_EPSILON,
                     _ => true,
@@ -56,13 +56,13 @@ impl OscSender {
             };
 
             if changed {
-                self.last_sent.insert(p.address, new_val);
+                self.last_sent.insert(p.address.clone(), new_val);
                 let args = match &p.value {
                     OscValue::Float(v) => vec![OscType::Float(*v)],
                     OscValue::Bool(v) => vec![OscType::Bool(*v)],
                 };
                 content.push(OscPacket::Message(OscMessage {
-                    addr: p.address.to_string(),
+                    addr: p.address.clone(),
                     args,
                 }));
             }
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn osc_messages_have_valid_addresses() {
         let bs = [0.5f32; BLENDSHAPE_COUNT];
-        let params = map_blendshapes(&bs, true);
+        let params = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
 
         for p in &params {
             assert!(p.address.starts_with('/'), "bad addr: {}", p.address);
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn osc_bundle_encodes_successfully() {
         let bs = [0.0f32; BLENDSHAPE_COUNT];
-        let params = map_blendshapes(&bs, true);
+        let params = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
 
         let content: Vec<OscPacket> = params
             .iter()
@@ -119,7 +119,7 @@ mod tests {
                     OscValue::Bool(v) => vec![OscType::Bool(*v)],
                 };
                 OscPacket::Message(OscMessage {
-                    addr: p.address.to_string(),
+                    addr: p.address.clone(),
                     args,
                 })
             })
@@ -158,14 +158,14 @@ mod tests {
         let mut sender = OscSender::new(target).unwrap();
 
         let bs = [0.5f32; BLENDSHAPE_COUNT];
-        let params = map_blendshapes(&bs, true);
+        let params = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
 
         // First send: all params are new, all should be sent
         let count1 = sender.send_params(&params).unwrap();
         assert!(count1 > 90, "first send should send all params, got {count1}");
 
         // Second send with identical values: nothing should be sent
-        let params2 = map_blendshapes(&bs, true);
+        let params2 = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
         let count2 = sender.send_params(&params2).unwrap();
         assert_eq!(count2, 0, "identical values should send nothing");
     }
@@ -178,13 +178,13 @@ mod tests {
         let mut sender = OscSender::new(target).unwrap();
 
         let bs = [0.0f32; BLENDSHAPE_COUNT];
-        let params = map_blendshapes(&bs, true);
+        let params = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
         sender.send_params(&params).unwrap();
 
         // Change one blendshape significantly
         let mut bs2 = [0.0f32; BLENDSHAPE_COUNT];
         bs2[17] = 0.8; // JawOpen
-        let params2 = map_blendshapes(&bs2, true);
+        let params2 = map_blendshapes(&bs2, true, "/avatar/parameters/FT/v2");
         let count = sender.send_params(&params2).unwrap();
         // Should send JawOpen + derived params that depend on it, but not all
         assert!(count > 0, "changed values should be sent");
@@ -199,13 +199,13 @@ mod tests {
         let mut sender = OscSender::new(target).unwrap();
 
         let bs = [0.5f32; BLENDSHAPE_COUNT];
-        let params = map_blendshapes(&bs, true);
+        let params = map_blendshapes(&bs, true, "/avatar/parameters/FT/v2");
         sender.send_params(&params).unwrap();
 
         // Tiny change below epsilon
         let mut bs2 = [0.5f32; BLENDSHAPE_COUNT];
         bs2[17] = 0.5005; // below FLOAT_EPSILON of 0.001
-        let params2 = map_blendshapes(&bs2, true);
+        let params2 = map_blendshapes(&bs2, true, "/avatar/parameters/FT/v2");
         let count = sender.send_params(&params2).unwrap();
         assert_eq!(count, 0, "sub-epsilon changes should be skipped");
     }
