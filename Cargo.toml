@@ -1,0 +1,10 @@
+[package]
+name = "livelink-vrcft"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight LiveLink Face to VRChat OSC bridge"
+license = "MIT"
+
+[dependencies]
+eframe = "0.34"
+rosc = "0.11"
