@@ -85,8 +85,6 @@ fn clamp01(v: f32) -> f32 {
 pub fn map_blendshapes(bs: &[f32; BLENDSHAPE_COUNT], connected: bool, prefix: &str) -> Vec<OscParam> {
     let mut params = Vec::with_capacity(128);
 
-    // Helper closures that capture `prefix`
-    let v2 = |name: &str| -> String { format!("{prefix}/{name}") };
     let float = |name: &str, value: f32| -> OscParam {
         OscParam {
             address: format!("{prefix}/{name}"),
@@ -300,9 +298,6 @@ pub fn map_blendshapes(bs: &[f32; BLENDSHAPE_COUNT], connected: bool, prefix: &s
         address: "/avatar/parameters/LipTrackingActive".to_string(),
         value: OscValue::Bool(connected),
     });
-
-    // Suppress unused variable warning
-    let _ = v2("_");
 
     params
 }
