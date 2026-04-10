@@ -48,6 +48,10 @@ struct Args {
     #[cfg(feature = "gui")]
     #[arg(long)]
     headless: bool,
+
+    /// Run a benchmark for N seconds, then print a performance summary and exit
+    #[arg(long, value_name = "SECONDS")]
+    benchmark: Option<u64>,
 }
 
 fn main() {
@@ -86,6 +90,15 @@ fn main() {
         "LiveLink :{listen_port} → OSC {osc_target} @ {}Hz (prefix={})",
         args.send_rate, args.prefix
     );
+
+    // Benchmark mode
+    if let Some(duration_secs) = args.benchmark {
+        run_benchmark(duration_secs, &state);
+        SHUTDOWN.store(true, Ordering::Relaxed);
+        let _ = recv_thread.join();
+        let _ = send_thread.join();
+        return;
+    }
 
     // GUI path: eframe takes over the main thread (default when compiled with gui feature)
     #[cfg(feature = "gui")]
@@ -223,4 +236,109 @@ fn run_sender(
             std::thread::sleep(interval - elapsed);
         }
     }
+}
+
+fn run_benchmark(duration_secs: u64, state: &Arc<RwLock<TrackingState>>) {
+    let duration = Duration::from_secs(duration_secs);
+    eprintln!("benchmark: running for {duration_secs}s...");
+    eprintln!("benchmark: send LiveLink data from your iPhone now\n");
+
+    // Wait for first packet or timeout
+    let wait_start = Instant::now();
+    loop {
+        if CONNECTED.load(Ordering::Relaxed) {
+            break;
+        }
+        if wait_start.elapsed() > Duration::from_secs(10) {
+            eprintln!("benchmark: no LiveLink packets received after 10s, running anyway\n");
+            break;
+        }
+        if !should_run() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Snapshot counters at start
+    let start = Instant::now();
+    let recv_start = state.read().map(|s| s.packets_received).unwrap_or(0);
+    let send_start = BUNDLES_SENT.load(Ordering::Relaxed);
+    let rss_start = read_rss_kb();
+
+    // Sample latency periodically
+    let mut latency_samples: Vec<u64> = Vec::new();
+    let mut peak_rss = rss_start;
+
+    while start.elapsed() < duration && should_run() {
+        std::thread::sleep(Duration::from_millis(100));
+
+        if let Ok(st) = state.read() {
+            if let Some(t) = st.last_packet_time {
+                latency_samples.push(t.elapsed().as_millis() as u64);
+            }
+        }
+
+        let rss = read_rss_kb();
+        if rss > peak_rss {
+            peak_rss = rss;
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let recv_end = state.read().map(|s| s.packets_received).unwrap_or(0);
+    let send_end = BUNDLES_SENT.load(Ordering::Relaxed);
+    let rss_end = read_rss_kb();
+
+    let recv_total = recv_end - recv_start;
+    let send_total = send_end - send_start;
+    let recv_rate = recv_total as f64 / elapsed;
+    let send_rate = send_total as f64 / elapsed;
+
+    let (lat_avg, lat_p50, lat_p99) = if !latency_samples.is_empty() {
+        let mut sorted = latency_samples.clone();
+        sorted.sort();
+        let avg = sorted.iter().sum::<u64>() as f64 / sorted.len() as f64;
+        let p50 = sorted[sorted.len() / 2];
+        let p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
+        (avg, p50, p99)
+    } else {
+        (0.0, 0, 0)
+    };
+
+    println!();
+    println!("═══════════════════════════════════════════");
+    println!("  livelink-vrcft benchmark ({elapsed:.1}s)");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  Throughput");
+    println!("    recv:   {recv_rate:>8.1} msg/s  ({recv_total} total)");
+    println!("    send:   {send_rate:>8.1} msg/s  ({send_total} total)");
+    println!();
+    println!("  Latency (recv → process)");
+    println!("    avg:    {lat_avg:>8.1} ms");
+    println!("    p50:    {lat_p50:>8} ms");
+    println!("    p99:    {lat_p99:>8} ms");
+    println!();
+    println!("  Memory (RSS)");
+    println!("    start:  {rss_start:>8} KB");
+    println!("    end:    {rss_end:>8} KB");
+    println!("    peak:   {peak_rss:>8} KB");
+    println!();
+    println!("═══════════════════════════════════════════");
+}
+
+/// Read current RSS (Resident Set Size) in KB from /proc/self/status.
+fn read_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+        })
+        .unwrap_or(0)
 }
