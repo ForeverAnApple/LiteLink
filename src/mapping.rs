@@ -82,7 +82,7 @@ fn clamp01(v: f32) -> f32 {
 
 /// Build the full list of OSC parameters from 61 ARKit blendshapes.
 /// `prefix` is the base path, e.g. "/avatar/parameters/FT/v2" or "/avatar/parameters/v2".
-pub fn map_blendshapes(bs: &[f32; BLENDSHAPE_COUNT], connected: bool, prefix: &str) -> Vec<OscParam> {
+pub fn map_blendshapes(bs: &[f32; BLENDSHAPE_COUNT], _connected: bool, prefix: &str) -> Vec<OscParam> {
     let mut params = Vec::with_capacity(128);
 
     let float = |name: &str, value: f32| -> OscParam {
@@ -286,17 +286,19 @@ pub fn map_blendshapes(bs: &[f32; BLENDSHAPE_COUNT], connected: bool, prefix: &s
     params.push(float("MouthStretch", (clamp01(bs[idx::MOUTH_STRETCH_LEFT]) + clamp01(bs[idx::MOUTH_STRETCH_RIGHT])) * 0.5));
 
     // --- Status parameters (no prefix, these are standard) ---
+    // Always report tracking as active so VRChat doesn't disable face tracking
+    // on brief disconnects. Data simply freezes until packets resume.
     params.push(OscParam {
         address: "/avatar/parameters/EyeTrackingActive".to_string(),
-        value: OscValue::Bool(connected),
+        value: OscValue::Bool(true),
     });
     params.push(OscParam {
         address: "/avatar/parameters/ExpressionTrackingActive".to_string(),
-        value: OscValue::Bool(connected),
+        value: OscValue::Bool(true),
     });
     params.push(OscParam {
         address: "/avatar/parameters/LipTrackingActive".to_string(),
-        value: OscValue::Bool(connected),
+        value: OscValue::Bool(true),
     });
 
     params
@@ -356,11 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn status_params_false_when_disconnected() {
+    fn status_params_always_true() {
         let bs = [0.0f32; BLENDSHAPE_COUNT];
         let params = map_blendshapes(&bs, false, DEFAULT_PREFIX);
         let s = params.iter().find(|p| p.address.contains("LipTrackingActive")).unwrap();
-        assert!(matches!(s.value, OscValue::Bool(false)));
+        assert!(matches!(s.value, OscValue::Bool(true)));
     }
 
     #[test]
