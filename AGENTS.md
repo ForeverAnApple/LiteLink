@@ -14,8 +14,9 @@ No Co-Authored-By. No multi-line bodies.
 ## Architecture
 
 - `src/livelink.rs` — UDP packet parser (LiveLink Face protocol)
-- `src/mapping.rs` — ARKit blendshape → VRChat OSC parameter mapping
+- `src/mapping.rs` — ARKit blendshape → Unified Expressions shapes → legacy float params + native `/tracking/face/v1` blob
+- `src/avatar.rs` — `--output` mode selection + VRChat OSC listener (avatar native-face-tracking flag)
 - `src/osc.rs` — OSC bundle construction + change detection sender
-- `src/state.rs` — Shared tracking state (RwLock + atomic connected flag)
+- `src/state.rs` — Shared tracking state (RwLock + atomic connected/avatar flags)
 - `src/gui.rs` — Optional egui status window (feature-gated behind `gui`)
 - `src/main.rs` — CLI, thread orchestration, signal handling

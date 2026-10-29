@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const BLENDSHAPE_COUNT: usize = 61;
@@ -29,6 +29,31 @@ pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Total OSC bundles sent (atomic so sender can increment without write lock).
 pub static BUNDLES_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// VRChat's `/avatar/avatarfullfacetracking` flag for the current avatar,
+/// encoded as 0 = unknown, 1 = false, 2 = true. Read through `avatar_native()`.
+static AVATAR_NATIVE: AtomicU8 = AtomicU8::new(0);
+
+/// Set on `/avatar/change`; the sender clears its change cache and resends everything.
+pub static RESEND_ALL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the current avatar uses native face tracking. `None` until VRChat says.
+pub fn avatar_native() -> Option<bool> {
+    match AVATAR_NATIVE.load(Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+pub fn set_avatar_native(flag: Option<bool>) {
+    let v = match flag {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    AVATAR_NATIVE.store(v, Ordering::Relaxed);
+}
 
 impl TrackingState {
     pub fn new() -> Self {

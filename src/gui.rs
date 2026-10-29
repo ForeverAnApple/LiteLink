@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::state::{TrackingState, BUNDLES_SENT, CONNECTED, SHUTDOWN};
+use crate::avatar::OutputMode;
+use crate::state::{avatar_native, TrackingState, BUNDLES_SENT, CONNECTED, SHUTDOWN};
 
 // Dark theme colors
 const BG: egui::Color32 = egui::Color32::from_rgb(24, 24, 28);
@@ -23,6 +24,7 @@ pub struct GuiConfig {
     pub osc_target: String,
     pub prefix: String,
     pub send_rate: u32,
+    pub output: OutputMode,
 }
 
 /// Which view is currently shown.
@@ -264,6 +266,15 @@ impl BridgeApp {
                         config_row(ui, "osc target", &self.config.osc_target);
                         config_row(ui, "prefix", &self.config.prefix);
                         config_row(ui, "send rate", &format!("{}Hz", self.config.send_rate));
+                        config_row(ui, "output", &format!("{:?}", self.config.output).to_lowercase());
+                        if self.config.output == OutputMode::Auto {
+                            let avatar = match avatar_native() {
+                                Some(true) => "native",
+                                Some(false) => "legacy",
+                                None => "unknown",
+                            };
+                            config_row(ui, "avatar", avatar);
+                        }
                     });
             });
     }

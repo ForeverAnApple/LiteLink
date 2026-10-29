@@ -15,10 +15,11 @@ Unreal Engine LiveLink Face iOS app and forwards it to VRChat via OSC.
                                          └──────────────┘
 ```
 
-Three threads:
+Threads:
 1. **UDP receiver** - listens on port 11111, parses LiveLink packets
 2. **OSC sender** - sends parameter updates to VRChat at ~100Hz
-3. **UI thread** - egui window for monitoring/overriding parameters
+3. **VRChat listener** - auto mode only: reads avatar info from VRChat's OSC output (:9001)
+4. **UI thread** - egui window for monitoring/overriding parameters
 
 Shared state between threads via `Arc<Mutex<TrackingState>>` (or atomics for hot path).
 
@@ -195,9 +196,62 @@ These are computed from the base expressions and sent as additional OSC params:
 ### Status Parameters (no v2/ prefix)
 | OSC Parameter                | Type | Value                        |
 |------------------------------|------|------------------------------|
-| `EyeTrackingActive`         | bool | true while receiving packets |
-| `ExpressionTrackingActive`  | bool | true while receiving packets |
-| `LipTrackingActive`         | bool | true while receiving packets |
+| `EyeTrackingActive`         | bool | always true                  |
+| `ExpressionTrackingActive`  | bool | always true                  |
+| `LipTrackingActive`         | bool | always true                  |
+
+Always true, so a brief disconnect doesn't make VRChat drop face tracking.
+When packets stop, the last frame keeps going out, frozen, until they resume.
+
+## Native Face Tracking (`/tracking/face/v1`)
+
+VRChat 2026.4.1 reads face data from one OSC message: type tag `,b`, a blob
+of exactly 102 bytes. Any other size is ignored. Each byte is
+`(clamp(v, 0, 1) * 255)` truncated, like VRCFT's C# `(byte)(x * 255)`.
+
+| Bytes  | Content                                                      |
+|--------|--------------------------------------------------------------|
+| 0-3    | EyeLook Out/In/Up/Down Right                                 |
+| 4-7    | EyeLook Out/In/Up/Down Left                                  |
+| 8-9    | EyeClosed Right, Left (ARKit eyeBlink)                       |
+| 10-13  | EyeDilation R/L, EyeConstrict R/L (ARKit has none: 0)        |
+| 14-101 | the 88 Unified Expressions shapes at `14 + ordinal`          |
+
+Ordinals follow VRCFT's `UnifiedExpressions` enum (`mapping::Ue`). Shapes
+ARKit cannot produce (nasal, cheek suck, tongue beyond TongueOut, etc.) stay 0.
+
+`mapping::UnifiedFace::from_arkit` computes the shapes once per tick. Both the
+blob and the legacy floats read from it, so they cannot disagree.
+`tests/fixtures/legacy_params.golden` pins the legacy output bit for bit.
+
+### Output modes
+
+`--output auto|legacy|native|both`. `auto` copies VRCFT:
+
+| Avatar flag (`/avatar/avatarfullfacetracking`) | Sent                        |
+|------------------------------------------------|-----------------------------|
+| unknown (startup, right after avatar change)   | blob + floats               |
+| true                                           | blob only, no `/avatar/parameters/*` |
+| false                                          | floats only                 |
+
+In auto mode a listener thread binds `--osc-listen` (default `127.0.0.1:9001`,
+VRChat's OSC output). `/avatar/change` resets the flag to unknown and clears
+the sender's change cache, so the new avatar receives every param, including
+the unchanging status bools. If the bind fails, it logs one warning and the
+flag stays unknown.
+
+The blob goes out every tick, in the same bundle as any changed floats: one
+UDP packet per tick. It waits for the first LiveLink packet; an all-zero blob
+would override the avatar's own blinks and visemes with a dead face. After a
+disconnect it keeps going out, frozen, like the floats.
+
+### Full resend
+
+Floats go out only when they change, so a constant (the status bools) would
+reach VRChat once per process. Every 2 seconds, in every mode, the sender
+clears its change cache and sends every param, so an avatar loaded later, or
+a restarted VRChat, catches up. It also resends everything on `/avatar/change`
+and whenever floats resume after a blob-only stretch.
 
 ## OSC Transport
 
@@ -224,7 +278,8 @@ src/
   main.rs          - entry point, spawns threads, runs egui
   livelink.rs      - UDP packet parsing
   osc.rs           - OSC message construction and sending
-  mapping.rs       - ARKit index → OSC parameter mapping tables
+  mapping.rs       - ARKit → Unified Expressions shapes, legacy params, native blob
+  avatar.rs        - output mode selection, VRChat avatar listener
   state.rs         - shared tracking state
 ```
 

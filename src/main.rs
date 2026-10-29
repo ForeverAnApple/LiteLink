@@ -1,3 +1,4 @@
+mod avatar;
 #[cfg(feature = "gui")]
 mod gui;
 mod livelink;
@@ -13,9 +14,15 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use log::{debug, error, info, warn};
 
-use crate::mapping::map_blendshapes;
+use crate::avatar::{select_outputs, OutputMode};
+use crate::mapping::{native_face_blob, LegacyParams, UnifiedFace};
 use crate::osc::OscSender;
-use crate::state::{TrackingState, BUNDLES_SENT, CONNECTED, SHUTDOWN};
+use crate::state::{avatar_native, TrackingState, BUNDLES_SENT, CONNECTED, RESEND_ALL, SHUTDOWN};
+
+/// Resend every param this often, whatever the mode. Change detection alone
+/// sends a constant (like the always-true status bools) once per process, so
+/// an avatar loaded later, or a restarted VRChat, would never receive it.
+const FULL_RESEND_INTERVAL: Duration = Duration::from_secs(2);
 
 fn should_run() -> bool {
     !SHUTDOWN.load(Ordering::Relaxed)
@@ -35,6 +42,15 @@ struct Args {
     /// OSC parameter prefix (must match your avatar's parameter naming)
     #[arg(long, default_value = "/avatar/parameters/FT/v2")]
     prefix: String,
+
+    /// Output format: native /tracking/face/v1 blob, legacy float params, or both.
+    /// `auto` asks VRChat whether the avatar uses native face tracking.
+    #[arg(long, value_enum, default_value_t = OutputMode::Auto)]
+    output: OutputMode,
+
+    /// Address to receive VRChat's OSC output on (used only by `--output auto`)
+    #[arg(long, default_value = "127.0.0.1:9001")]
+    osc_listen: String,
 
     /// OSC send rate in Hz
     #[arg(long, default_value_t = 60)]
@@ -62,6 +78,10 @@ fn main() {
         .osc_target
         .parse()
         .expect("invalid --osc-target address");
+    let osc_listen: std::net::SocketAddr = args
+        .osc_listen
+        .parse()
+        .expect("invalid --osc-listen address");
     let send_interval = Duration::from_micros(1_000_000 / args.send_rate as u64);
     let timeout = Duration::from_secs_f64(args.timeout);
 
@@ -81,14 +101,23 @@ fn main() {
 
     let send_state = Arc::clone(&state);
     let prefix = args.prefix.clone();
+    let output = args.output;
     let send_thread = std::thread::Builder::new()
         .name("osc-sender".into())
-        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state, &prefix))
+        .spawn(move || run_sender(osc_target, send_interval, timeout, send_state, &prefix, output))
         .expect("failed to spawn sender thread");
 
+    // Only auto mode cares what avatar VRChat has loaded.
+    let listen_thread = (output == OutputMode::Auto).then(|| {
+        std::thread::Builder::new()
+            .name("vrchat-listener".into())
+            .spawn(move || avatar::run_listener(osc_listen))
+            .expect("failed to spawn VRChat listener thread")
+    });
+
     info!(
-        "LiveLink :{listen_port} → OSC {osc_target} @ {}Hz (prefix={})",
-        args.send_rate, args.prefix
+        "LiveLink :{listen_port} → OSC {osc_target} @ {}Hz (prefix={}, output={:?})",
+        args.send_rate, args.prefix, output
     );
 
     // Benchmark mode
@@ -97,6 +126,9 @@ fn main() {
         SHUTDOWN.store(true, Ordering::Relaxed);
         let _ = recv_thread.join();
         let _ = send_thread.join();
+        if let Some(t) = listen_thread {
+            let _ = t.join();
+        }
         return;
     }
 
@@ -108,6 +140,7 @@ fn main() {
             osc_target: args.osc_target.clone(),
             prefix: args.prefix.clone(),
             send_rate: args.send_rate,
+            output,
         };
         if let Err(e) = gui::run(Arc::clone(&state), gui_config) {
             error!("GUI error: {e}");
@@ -115,12 +148,18 @@ fn main() {
         SHUTDOWN.store(true, Ordering::Relaxed);
         let _ = recv_thread.join();
         let _ = send_thread.join();
+        if let Some(t) = listen_thread {
+            let _ = t.join();
+        }
         return;
     }
 
     // Headless path
     let _ = recv_thread.join();
     let _ = send_thread.join();
+    if let Some(t) = listen_thread {
+        let _ = t.join();
+    }
     info!("goodbye");
 }
 
@@ -189,14 +228,18 @@ fn run_sender(
     timeout: Duration,
     state: Arc<RwLock<TrackingState>>,
     prefix: &str,
+    mode: OutputMode,
 ) {
     let mut sender = OscSender::new(target).expect("failed to create OSC sender");
+    let legacy = LegacyParams::new(prefix);
     let mut last_stats = Instant::now();
+    let mut last_full_resend = Instant::now();
+    let mut sent_floats_last_tick = false;
 
     while should_run() {
         let start = Instant::now();
 
-        let (blendshapes, connected, device_id, packets_received) = {
+        let (blendshapes, connected, ever_connected, device_id, packets_received) = {
             let st = match state.read() {
                 Ok(st) => st,
                 Err(poisoned) => poisoned.into_inner(),
@@ -212,11 +255,28 @@ fn run_sender(
                 }
             }
 
-            (st.blendshapes, connected, st.device_id.clone(), st.packets_received)
+            let ever_connected = st.last_packet_time.is_some();
+            (st.blendshapes, connected, ever_connected, st.device_id.clone(), st.packets_received)
         };
 
-        let params = map_blendshapes(&blendshapes, connected, prefix);
-        if let Err(e) = sender.send_params(&params) {
+        let outputs = select_outputs(mode, avatar_native());
+        // A new avatar has none of our state, and floats resuming after a
+        // native-only stretch may be stale in VRChat: send every param once.
+        let resend = RESEND_ALL.swap(false, Ordering::Relaxed);
+        let periodic = last_full_resend.elapsed() >= FULL_RESEND_INTERVAL;
+        if resend || periodic || (outputs.floats && !sent_floats_last_tick) {
+            sender.reset();
+            last_full_resend = Instant::now();
+        }
+        sent_floats_last_tick = outputs.floats;
+
+        let face = UnifiedFace::from_arkit(&blendshapes);
+        let params = if outputs.floats { legacy.params(&face) } else { Vec::new() };
+        // No blob until the phone has sent something: an all-zero blob would
+        // override the avatar's own blinks and visemes with a dead face. After
+        // a disconnect the last frame keeps going out, frozen, like the floats.
+        let blob = (outputs.blob && ever_connected).then(|| native_face_blob(&face));
+        if let Err(e) = sender.send(&params, blob.as_ref().map(|b| &b[..])) {
             warn!("OSC send error: {e}");
         }
         BUNDLES_SENT.fetch_add(1, Ordering::Relaxed);
