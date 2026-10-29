@@ -371,3 +371,37 @@ fn blob_waits_for_first_livelink_packet() {
         "blob stopped after disconnect"
     );
 }
+
+/// A taken LiveLink port must end the process, so launchers notice; a live
+/// process with no input would send a frozen face forever.
+#[test]
+fn exits_when_livelink_port_taken() {
+    let port = 19611;
+    // Same address litelink binds, so the conflict is real.
+    let _holder = UdpSocket::bind(("0.0.0.0", port)).unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_litelink"));
+    cmd.args(["--listen-port", &port.to_string()])
+        .args(["--osc-target", "127.0.0.1:19622"])
+        .args(["--osc-listen", "127.0.0.1:19633"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if cfg!(feature = "gui") {
+        cmd.arg("--headless");
+    }
+    let mut child = ChildGuard(cmd.spawn().expect("failed to start litelink"));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "litelink kept running with its port taken");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "expected a failing exit status, got {status}");
+
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.0.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(stderr.contains("already in use"), "stderr lacks the cause: {stderr}");
+}

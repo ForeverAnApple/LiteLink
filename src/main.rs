@@ -85,6 +85,9 @@ fn main() {
     let send_interval = Duration::from_micros(1_000_000 / args.send_rate as u64);
     let timeout = Duration::from_secs_f64(args.timeout);
 
+    // Before any thread: a taken port must end the process, not one thread.
+    let livelink_socket = bind_livelink(args.listen_port);
+
     ctrlc::set_handler(|| {
         SHUTDOWN.store(true, Ordering::Relaxed);
     })
@@ -96,7 +99,7 @@ fn main() {
     let listen_port = args.listen_port;
     let recv_thread = std::thread::Builder::new()
         .name("udp-receiver".into())
-        .spawn(move || run_receiver(listen_port, recv_state))
+        .spawn(move || run_receiver(livelink_socket, recv_state))
         .expect("failed to spawn receiver thread");
 
     let send_state = Arc::clone(&state);
@@ -163,11 +166,23 @@ fn main() {
     info!("goodbye");
 }
 
-fn run_receiver(port: u16, state: Arc<RwLock<TrackingState>>) {
-    let addr = format!("0.0.0.0:{port}");
-    let socket = UdpSocket::bind(&addr).unwrap_or_else(|e| {
-        panic!("failed to bind UDP socket on {addr}: {e}");
-    });
+/// Bind the LiveLink port or exit. Without it litelink can only send a frozen
+/// face forever, so dying lets launchers (`wait -n`) notice.
+fn bind_livelink(port: u16) -> UdpSocket {
+    match UdpSocket::bind(("0.0.0.0", port)) {
+        Ok(socket) => socket,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                error!("LiveLink port {port} is already in use (another litelink or vrc-face-tracking running?): {e}");
+            } else {
+                error!("cannot bind LiveLink port {port}: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_receiver(socket: UdpSocket, state: Arc<RwLock<TrackingState>>) {
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
